@@ -33,6 +33,7 @@ A single-binary fleet agent in Rust. One process. One event loop. Zero external 
                     ┌─────────▼───────────────┐
                     │         ACT             │
                     │  execute side-effects   │
+                    │  (placeholder: stderr)  │
                     └─────────┬───────────────┘
                               │
                               ▼
@@ -51,11 +52,12 @@ A single-binary fleet agent in Rust. One process. One event loop. Zero external 
 ## Types
 
 - `AgentId`, `AgentConfig` — identity and configuration
+  - `coupling` and `gain` are reserved fields; not yet used by the loop
 - `State` — vector of float values with sign pattern
 - `Observation` — peer state + bearing rate
 - `Action` — `Hold | ChangeHeading | Refit | Prune | Broadcast`
 - `Phase` — `Commissioning | Operational | Stressed | Recovering`
-- `BuildRecord` — keel date, refits, prunes
+- `BuildRecord` — keel date, refits, prunes (populated from `Refit`/`Prune` actions)
 - `LogEntry` — (tick, phase, observation, action)
 
 ## Usage
@@ -92,9 +94,11 @@ for tick in 0..100 {
 
 ```bash
 cargo build
-cargo test    # 31 tests
+cargo test    # 35 tests
 cargo run     # 100-tick demonstration
 ```
+
+Continuous integration runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build`, and `cargo test` on every push and PR.
 
 ## License
 
