@@ -180,6 +180,7 @@ impl FleetAgent {
         // ACT (placeholder — just records)
         Self::act(&actions);
         // RECORD
+        self.record_build_events(&actions);
         let log_obs = sensed_refs.first().cloned();
         let entry = LogEntry {
             tick: self.tick,
@@ -366,6 +367,21 @@ impl FleetAgent {
     // -----------------------------------------------------------------------
     // RECORD helpers
     // -----------------------------------------------------------------------
+
+    /// Persist build-level outcomes of the chosen actions.
+    fn record_build_events(&mut self, actions: &[Action]) {
+        for action in actions {
+            match action {
+                Action::Refit(c) => {
+                    self.build.refits.push(format!("{}:{}", c.name, c.version));
+                }
+                Action::Prune { target, reason } => {
+                    self.build.prunes.push((target.clone(), reason.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
 
     /// Tick-level state evolution (simple decay + noise for simulation).
     fn tick_state(&mut self) {
@@ -789,6 +805,66 @@ mod tests {
         let actions = agent.decide(&obs, true, Phase::Operational);
         // Response with heading adjustment
         assert!(matches!(actions[0], Action::ChangeHeading(_)));
+    }
+
+    #[test]
+    fn test_build_record_tracks_refits() {
+        let mut cfg = default_config();
+        cfg.constraints = vec![Constraint {
+            name: "tight".into(),
+            description: "Strict".into(),
+            threshold: 0.5,
+        }];
+        let mut agent = FleetAgent::new(cfg);
+        // Operational age so the constraint violation produces Refit.
+        for _ in 0..55 {
+            let _ = agent.tick(vec![]);
+        }
+        assert!(agent.build_record().refits.contains(&"core:0.1".into()));
+    }
+
+    #[test]
+    fn test_build_record_tracks_prunes() {
+        let mut cfg = default_config();
+        cfg.heading = None;
+        let mut agent = FleetAgent::new(cfg);
+        for _ in 0..55 {
+            let _ = agent.tick(vec![]);
+        }
+        let obs = vec![Observation {
+            from: "rogue".into(),
+            state: State {
+                values: vec![99.0],
+                timestamp: 0,
+                sign_pattern: vec![1],
+            },
+            bearing_rate: 0.0001,
+        }];
+        let _ = agent.tick(obs);
+        assert_eq!(
+            agent.build_record().prunes,
+            vec![("rogue".into(), "collision avoidance".into())]
+        );
+    }
+
+    #[test]
+    fn test_build_record_refits_increment_version() {
+        let mut cfg = default_config();
+        cfg.constraints = vec![Constraint {
+            name: "tight".into(),
+            description: "Strict".into(),
+            threshold: 0.5,
+        }];
+        let mut agent = FleetAgent::new(cfg);
+        for _ in 0..55 {
+            let _ = agent.tick(vec![]);
+        }
+        // First refit
+        let _ = agent.tick(vec![]);
+        assert!(agent.build_record().refits.contains(&"core:0.1".into()));
+        // Second refit should use the next version based on recorded history.
+        let _ = agent.tick(vec![]);
+        assert!(agent.build_record().refits.contains(&"core:1.1".into()));
     }
 
     // -----------------------------------------------------------------------
