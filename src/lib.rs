@@ -1016,4 +1016,34 @@ mod tests {
         // Simple deterministic value for testing
         0.5 + (fast_mod(42.0, 13.0) / 13.0)
     }
+
+    #[test]
+    fn probe_collision_course_no_overlap_is_relevant() {
+        // Regression guard: a collision-course observation (bearing_rate < 0.01)
+        // from a peer with no sign-pattern overlap must still be treated as
+        // relevant by sense() — otherwise a genuine collision threat from an
+        // unassociated peer would be silently filtered out of decide()/act().
+        // (The existing test_tick_filters_irrelevant_observations_from_phase
+        // above does not actually exercise this: its observation uses
+        // bearing_rate 0.5, which never crosses the has_stress() threshold
+        // either before or after this fix, so it passes unconditionally.)
+        let cfg = default_config();
+        let agent = FleetAgent::new(cfg);
+        let collision_no_overlap = Observation {
+            from: "foreign".into(),
+            state: State {
+                values: vec![1.0],
+                timestamp: 0,
+                sign_pattern: vec![],
+            },
+            bearing_rate: 0.005,
+        };
+        let binding = [collision_no_overlap];
+        let result = agent.sense(&binding);
+        assert_eq!(
+            result.len(),
+            1,
+            "collision-course observation from a non-overlapping peer must be treated as relevant"
+        );
+    }
 }
