@@ -242,12 +242,7 @@ impl FleetAgent {
 
     /// Evaluate a single constraint: state values must stay below threshold.
     fn eval_constraint(&self, c: &Constraint) -> bool {
-        let max_val = self
-            .state
-            .values
-            .iter()
-            .cloned()
-            .fold(0.0_f64, f64::max);
+        let max_val = self.state.values.iter().cloned().fold(0.0_f64, f64::max);
         max_val < c.threshold
     }
 
@@ -850,9 +845,14 @@ mod tests {
         }];
         let actions = agent.tick(obs);
         // Should produce stress actions
-        let has_evasive = actions.iter().any(|a| matches!(a, Action::ChangeHeading(_)));
+        let has_evasive = actions
+            .iter()
+            .any(|a| matches!(a, Action::ChangeHeading(_)));
         let has_broadcast = actions.iter().any(|a| matches!(a, Action::Broadcast(_)));
-        assert!(has_evasive || has_broadcast, "Expected stress-related actions");
+        assert!(
+            has_evasive || has_broadcast,
+            "Expected stress-related actions"
+        );
     }
 
     // -----------------------------------------------------------------------
