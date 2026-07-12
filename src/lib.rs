@@ -164,24 +164,13 @@ impl FleetAgent {
     /// Run one full loop iteration: SENSE → CONSTRAINT CHECK → ORIENT → DECIDE → ACT → RECORD.
     /// Returns the actions decided during this tick.
     pub fn tick(&mut self, external: Vec<Observation>) -> Vec<Action> {
-        // SENSE — clone external since we borrow it for sense and need to store it
-        let sensed_refs: Vec<Observation> = {
-            let mut out = Vec::with_capacity(external.len());
-            for obs in &external {
-                if obs.bearing_rate.is_finite()
-                    && obs
-                        .state
-                        .sign_pattern
-                        .iter()
-                        .zip(self.state.sign_pattern.iter())
-                        .any(|(a, b)| a == b)
-                {
-                    out.push(obs.clone());
-                }
-            }
-            out
-        };
-        self.observations.extend(external);
+        // SENSE — reuse the public filter so tick and sense cannot diverge.
+        let sensed_refs: Vec<Observation> = self.sense(&external).into_iter().cloned().collect();
+        // Only filtered, relevant observations feed the persistent observation
+        // history used by ORIENT. Otherwise irrelevant noise (NaN bearing,
+        // benign sign-pattern mismatch) could falsely drive the agent into
+        // stress.
+        self.observations.extend(sensed_refs.clone());
         // CONSTRAINT CHECK
         let constraints_ok = self.check_constraints();
         // ORIENT
@@ -209,20 +198,23 @@ impl FleetAgent {
     // SENSE
     // -----------------------------------------------------------------------
 
-    /// Filter external observations, returning only those relevant (e.g. from
-    /// known peers or observations whose sign pattern overlaps with ours).
+    /// Filter external observations, returning only those relevant.
+    ///
+    /// An observation is relevant when its bearing is sensible and either:
+    /// - its sign pattern overlaps with ours (peer coordination), or
+    /// - its bearing rate indicates a collision course (`< 0.01`).
     pub fn sense<'a>(&self, external: &'a [Observation]) -> Vec<&'a Observation> {
         external
             .iter()
             .filter(|obs| {
-                // Relevance: bearing_rate is sensible OR sign_pattern overlaps
                 obs.bearing_rate.is_finite()
-                    && obs
-                        .state
-                        .sign_pattern
-                        .iter()
-                        .zip(self.state.sign_pattern.iter())
-                        .any(|(a, b)| a == b)
+                    && (obs.bearing_rate < 0.01
+                        || obs
+                            .state
+                            .sign_pattern
+                            .iter()
+                            .zip(self.state.sign_pattern.iter())
+                            .any(|(a, b)| a == b))
             })
             .collect()
     }
@@ -640,6 +632,31 @@ mod tests {
             bearing_rate: 3.0,
         }];
         assert!(agent.sense(&obs).is_empty());
+    }
+
+    #[test]
+    fn test_tick_filters_irrelevant_observations_from_phase() {
+        let cfg = default_config();
+        let mut agent = FleetAgent::new(cfg);
+        // Run past commissioning so phase depends on observations, not age.
+        for _ in 0..55 {
+            let _ = agent.tick(vec![]);
+        }
+        assert_eq!(agent.phase(), Phase::Operational);
+        // Irrelevant observation: sign pattern does not overlap and bearing is
+        // benign. It must be filtered and must NOT drive the agent into Stressed.
+        let irrelevant = Observation {
+            from: "ghost".into(),
+            state: State {
+                values: vec![10.0],
+                timestamp: 0,
+                sign_pattern: vec![], // no overlap possible
+            },
+            bearing_rate: 0.5,
+        };
+        let actions = agent.tick(vec![irrelevant]);
+        assert_eq!(agent.phase(), Phase::Operational);
+        assert_eq!(actions, vec![Action::Hold]);
     }
 
     // -----------------------------------------------------------------------
