@@ -68,7 +68,9 @@ fn main() {
             println!(
                 "  tick {:>3} | ▶ phase transition: {} → {}",
                 tick,
-                prev_phase.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
+                prev_phase
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "—".into()),
                 phase
             );
             prev_phase = Some(phase);

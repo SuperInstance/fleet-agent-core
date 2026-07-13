@@ -164,24 +164,13 @@ impl FleetAgent {
     /// Run one full loop iteration: SENSE → CONSTRAINT CHECK → ORIENT → DECIDE → ACT → RECORD.
     /// Returns the actions decided during this tick.
     pub fn tick(&mut self, external: Vec<Observation>) -> Vec<Action> {
-        // SENSE — clone external since we borrow it for sense and need to store it
-        let sensed_refs: Vec<Observation> = {
-            let mut out = Vec::with_capacity(external.len());
-            for obs in &external {
-                if obs.bearing_rate.is_finite()
-                    && obs
-                        .state
-                        .sign_pattern
-                        .iter()
-                        .zip(self.state.sign_pattern.iter())
-                        .any(|(a, b)| a == b)
-                {
-                    out.push(obs.clone());
-                }
-            }
-            out
-        };
-        self.observations.extend(external);
+        // SENSE — reuse the public filter so tick and sense cannot diverge.
+        let sensed_refs: Vec<Observation> = self.sense(&external).into_iter().cloned().collect();
+        // Only filtered, relevant observations feed the persistent observation
+        // history used by ORIENT. Otherwise irrelevant noise (NaN bearing,
+        // benign sign-pattern mismatch) could falsely drive the agent into
+        // stress.
+        self.observations.extend(sensed_refs.clone());
         // CONSTRAINT CHECK
         let constraints_ok = self.check_constraints();
         // ORIENT
@@ -191,6 +180,7 @@ impl FleetAgent {
         // ACT (placeholder — just records)
         Self::act(&actions);
         // RECORD
+        self.record_build_events(&actions);
         let log_obs = sensed_refs.first().cloned();
         let entry = LogEntry {
             tick: self.tick,
@@ -209,20 +199,23 @@ impl FleetAgent {
     // SENSE
     // -----------------------------------------------------------------------
 
-    /// Filter external observations, returning only those relevant (e.g. from
-    /// known peers or observations whose sign pattern overlaps with ours).
+    /// Filter external observations, returning only those relevant.
+    ///
+    /// An observation is relevant when its bearing is sensible and either:
+    /// - its sign pattern overlaps with ours (peer coordination), or
+    /// - its bearing rate indicates a collision course (`< 0.01`).
     pub fn sense<'a>(&self, external: &'a [Observation]) -> Vec<&'a Observation> {
         external
             .iter()
             .filter(|obs| {
-                // Relevance: bearing_rate is sensible OR sign_pattern overlaps
                 obs.bearing_rate.is_finite()
-                    && obs
-                        .state
-                        .sign_pattern
-                        .iter()
-                        .zip(self.state.sign_pattern.iter())
-                        .any(|(a, b)| a == b)
+                    && (obs.bearing_rate < 0.01
+                        || obs
+                            .state
+                            .sign_pattern
+                            .iter()
+                            .zip(self.state.sign_pattern.iter())
+                            .any(|(a, b)| a == b))
             })
             .collect()
     }
@@ -242,12 +235,7 @@ impl FleetAgent {
 
     /// Evaluate a single constraint: state values must stay below threshold.
     fn eval_constraint(&self, c: &Constraint) -> bool {
-        let max_val = self
-            .state
-            .values
-            .iter()
-            .cloned()
-            .fold(0.0_f64, f64::max);
+        let max_val = self.state.values.iter().cloned().fold(0.0_f64, f64::max);
         max_val < c.threshold
     }
 
@@ -379,6 +367,21 @@ impl FleetAgent {
     // -----------------------------------------------------------------------
     // RECORD helpers
     // -----------------------------------------------------------------------
+
+    /// Persist build-level outcomes of the chosen actions.
+    fn record_build_events(&mut self, actions: &[Action]) {
+        for action in actions {
+            match action {
+                Action::Refit(c) => {
+                    self.build.refits.push(format!("{}:{}", c.name, c.version));
+                }
+                Action::Prune { target, reason } => {
+                    self.build.prunes.push((target.clone(), reason.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
 
     /// Tick-level state evolution (simple decay + noise for simulation).
     fn tick_state(&mut self) {
@@ -647,6 +650,31 @@ mod tests {
         assert!(agent.sense(&obs).is_empty());
     }
 
+    #[test]
+    fn test_tick_filters_irrelevant_observations_from_phase() {
+        let cfg = default_config();
+        let mut agent = FleetAgent::new(cfg);
+        // Run past commissioning so phase depends on observations, not age.
+        for _ in 0..55 {
+            let _ = agent.tick(vec![]);
+        }
+        assert_eq!(agent.phase(), Phase::Operational);
+        // Irrelevant observation: sign pattern does not overlap and bearing is
+        // benign. It must be filtered and must NOT drive the agent into Stressed.
+        let irrelevant = Observation {
+            from: "ghost".into(),
+            state: State {
+                values: vec![10.0],
+                timestamp: 0,
+                sign_pattern: vec![], // no overlap possible
+            },
+            bearing_rate: 0.5,
+        };
+        let actions = agent.tick(vec![irrelevant]);
+        assert_eq!(agent.phase(), Phase::Operational);
+        assert_eq!(actions, vec![Action::Hold]);
+    }
+
     // -----------------------------------------------------------------------
     // CONSTRAINT CHECK
     // -----------------------------------------------------------------------
@@ -779,6 +807,66 @@ mod tests {
         assert!(matches!(actions[0], Action::ChangeHeading(_)));
     }
 
+    #[test]
+    fn test_build_record_tracks_refits() {
+        let mut cfg = default_config();
+        cfg.constraints = vec![Constraint {
+            name: "tight".into(),
+            description: "Strict".into(),
+            threshold: 0.5,
+        }];
+        let mut agent = FleetAgent::new(cfg);
+        // Operational age so the constraint violation produces Refit.
+        for _ in 0..55 {
+            let _ = agent.tick(vec![]);
+        }
+        assert!(agent.build_record().refits.contains(&"core:0.1".into()));
+    }
+
+    #[test]
+    fn test_build_record_tracks_prunes() {
+        let mut cfg = default_config();
+        cfg.heading = None;
+        let mut agent = FleetAgent::new(cfg);
+        for _ in 0..55 {
+            let _ = agent.tick(vec![]);
+        }
+        let obs = vec![Observation {
+            from: "rogue".into(),
+            state: State {
+                values: vec![99.0],
+                timestamp: 0,
+                sign_pattern: vec![1],
+            },
+            bearing_rate: 0.0001,
+        }];
+        let _ = agent.tick(obs);
+        assert_eq!(
+            agent.build_record().prunes,
+            vec![("rogue".into(), "collision avoidance".into())]
+        );
+    }
+
+    #[test]
+    fn test_build_record_refits_increment_version() {
+        let mut cfg = default_config();
+        cfg.constraints = vec![Constraint {
+            name: "tight".into(),
+            description: "Strict".into(),
+            threshold: 0.5,
+        }];
+        let mut agent = FleetAgent::new(cfg);
+        for _ in 0..55 {
+            let _ = agent.tick(vec![]);
+        }
+        // First refit
+        let _ = agent.tick(vec![]);
+        assert!(agent.build_record().refits.contains(&"core:0.1".into()));
+        // Second refit should use the next version based on recorded history.
+        let _ = agent.tick(vec![]);
+        assert!(agent.build_record().refits.contains(&"core:1.1".into()));
+    }
+
     // -----------------------------------------------------------------------
     // Full tick integration
     // -----------------------------------------------------------------------
@@ -850,9 +938,14 @@ mod tests {
         }];
         let actions = agent.tick(obs);
         // Should produce stress actions
-        let has_evasive = actions.iter().any(|a| matches!(a, Action::ChangeHeading(_)));
+        let has_evasive = actions
+            .iter()
+            .any(|a| matches!(a, Action::ChangeHeading(_)));
         let has_broadcast = actions.iter().any(|a| matches!(a, Action::Broadcast(_)));
-        assert!(has_evasive || has_broadcast, "Expected stress-related actions");
+        assert!(
+            has_evasive || has_broadcast,
+            "Expected stress-related actions"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -922,5 +1015,35 @@ mod tests {
     fn rand_bearing() -> f64 {
         // Simple deterministic value for testing
         0.5 + (fast_mod(42.0, 13.0) / 13.0)
+    }
+
+    #[test]
+    fn probe_collision_course_no_overlap_is_relevant() {
+        // Regression guard: a collision-course observation (bearing_rate < 0.01)
+        // from a peer with no sign-pattern overlap must still be treated as
+        // relevant by sense() — otherwise a genuine collision threat from an
+        // unassociated peer would be silently filtered out of decide()/act().
+        // (The existing test_tick_filters_irrelevant_observations_from_phase
+        // above does not actually exercise this: its observation uses
+        // bearing_rate 0.5, which never crosses the has_stress() threshold
+        // either before or after this fix, so it passes unconditionally.)
+        let cfg = default_config();
+        let agent = FleetAgent::new(cfg);
+        let collision_no_overlap = Observation {
+            from: "foreign".into(),
+            state: State {
+                values: vec![1.0],
+                timestamp: 0,
+                sign_pattern: vec![],
+            },
+            bearing_rate: 0.005,
+        };
+        let binding = [collision_no_overlap];
+        let result = agent.sense(&binding);
+        assert_eq!(
+            result.len(),
+            1,
+            "collision-course observation from a non-overlapping peer must be treated as relevant"
+        );
     }
 }
